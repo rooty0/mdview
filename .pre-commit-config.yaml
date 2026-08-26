@@ -1,0 +1,23 @@
+---
+minimum_pre_commit_version: "4.3.0"
+repos:
+  - repo: https://github.com/editorconfig-checker/editorconfig-checker.python
+    rev: "3.6.1"
+    hooks:
+      - id: editorconfig-checker
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+  # The upstream koalaman/shellcheck-precommit hook runs via Docker, which
+  # is overkill for a one-file repo and fails when the daemon is stopped.
+  # Use the locally installed shellcheck instead (brew install shellcheck).
+  - repo: local
+    hooks:
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
