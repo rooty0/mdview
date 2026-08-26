@@ -10,6 +10,8 @@ server, no build step, no npm. Pages are plain `file://` HTML.
 
     mdview/
       mdview                    # the entire program (~1270 lines)
+      test.sh                   # integration tests, ./test.sh
+      README.md                 # user-facing docs
       AGENTS.md
       .pre-commit-config.yaml   # editorconfig-checker, whitespace, shellcheck
       .editorconfig
@@ -192,19 +194,27 @@ cleared before launching Chrome so pages outlive the process.
 
 ## Testing
 
-There is no test suite. Verify changes by rendering and inspecting output:
+`./test.sh` — 50 assertions, ~30s, no arguments needed. `-l` lists test
+names; passing substrings runs a subset (`./test.sh raw diff`). Every render
+uses `-o` so Chrome is never launched, and all fixtures live under one temp
+dir that's removed on exit.
 
-```bash
-./mdview -o /tmp/t1 some.md              # single file
-./mdview -a -o /tmp/t2 some.md           # whole tree, cross-links
-./mdview -R -o /tmp/t3 some.md           # sourcepos + embedded source
-MDVIEW_JOBS=8 ./mdview -a -R -o /tmp/t4 some.md   # race check
-shellcheck mdview
-```
+Add a case there for any behaviour change. Several tests exist purely to
+pin down the gotchas above — `header_script_balance` and
+`mktemp_templates` lint the source directly, and `parallel_isolation`
+renders 40 uniquely-marked files at `MDVIEW_JOBS=8` and asserts no page
+picked up another's content.
 
-For parallel-safety changes, generate N files each containing a unique
-marker, render with a high `MDVIEW_JOBS`, and assert every output page
-contains only its own marker.
+Two constraints when writing tests:
 
-Browser-side behaviour (hotkeys, modals, mermaid, copy buttons) needs a
-manual pass in Chrome — it isn't covered by anything automated.
+- **Signal background jobs with `SIGTERM`, not `SIGINT`.** Bash sets SIGINT
+  to ignored for async jobs when job control is off, and a signal ignored at
+  entry can't be trapped, so the script's INT handler never runs and `wait`
+  blocks forever. Use the `stop_bg` helper. Interactive Ctrl-C is fine.
+- **macOS `mktemp -t` ignores `TMPDIR`**, always using the per-user
+  `/var/folders` dir, so a run's temp dir can't be redirected into the test
+  sandbox. Use `list_run_dirs` and diff against a baseline instead.
+
+Browser-side behaviour (hotkeys, modals, mermaid rendering, copy buttons)
+still needs a manual pass in Chrome. The tests only assert that the right
+markup and scripts were emitted.
