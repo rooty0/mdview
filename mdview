@@ -1,0 +1,1266 @@
+#!/usr/bin/env bash
+#
+# mdview - render Markdown with GitHub-style CSS and open it in Chrome.
+#
+# Usage:
+#   mdview [-a|--all] [-r|--root DIR] [-d|--diff] [-R|--raw] [-W|--watch]
+#          [-o|--output DIR] <file.md>
+#
+# Options:
+#   -a, --all         Also render every other .md / .markdown file found under
+#                     the root directory (recursively) and rewrite *.md links
+#                     so you can click between pages in the browser.
+#   -r, --root DIR    Root directory for --all (defaults to the current working
+#                     directory). The entry file must live inside this dir.
+#   -d, --diff        Append a collapsible git diff block to the rendered page
+#                     (requires the file to be tracked by git).
+#   -R, --raw         Enable a "Raw" button (hotkey r) that shows the original
+#                     markdown source for the current text selection. Increases
+#                     rendered HTML size because pandoc annotates every element
+#                     with source positions.
+#   -W, --watch       Keep running and re-render whenever a watched .md file
+#                     changes. Reload the page in the browser yourself to pick
+#                     up changes. Ctrl-C to stop. Poll interval in seconds can
+#                     be set with MDVIEW_WATCH_INTERVAL (default 1).
+#   -o, --output DIR  Render into DIR instead of a temp dir, and do not open
+#                     Chrome. Created if missing. Existing files are overwritten.
+
+set -euo pipefail
+
+ALL=false
+ROOT_DIR=""
+# WANT_DIFF holds the user's intent and is never reassigned. Whether a diff
+# actually exists is recomputed per render pass, so --watch keeps working
+# after the file gains or loses uncommitted changes.
+WANT_DIFF=false
+SHOW_RAW=false
+WATCH=false
+OUTPUT_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--all) ALL=true; shift ;;
+        -d|--diff) WANT_DIFF=true; shift ;;
+        -R|--raw) SHOW_RAW=true; shift ;;
+        -W|--watch) WATCH=true; shift ;;
+        -r|--root)
+            [[ $# -ge 2 ]] || { echo "Error: --root needs an argument" >&2; exit 2; }
+            ROOT_DIR=$2; shift 2 ;;
+        -o|--output)
+            [[ $# -ge 2 ]] || { echo "Error: --output needs an argument" >&2; exit 2; }
+            OUTPUT_DIR=$2; shift 2 ;;
+        -h|--help)
+            sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --) shift; break ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    sed -n 's/^#   mdview/Usage: mdview/p' "$0" | head -1 >&2
+    echo "Try '$(basename "$0") -h' for more information." >&2
+    exit 2
+fi
+
+MD_FILE=$1
+
+if [[ ! -f "$MD_FILE" ]]; then
+    echo "Error: file not found: $MD_FILE" >&2
+    exit 1
+fi
+
+if ! command -v pandoc >/dev/null 2>&1; then
+    echo "Error: pandoc is not installed." >&2
+    echo "Install it with:" >&2
+    echo "    brew install pandoc" >&2
+    exit 1
+fi
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/Library/Caches}/mdview"
+mkdir -p "$CACHE_DIR"
+
+CSS_FILE="$CACHE_DIR/github-markdown.css"
+CSS_REPO="sindresorhus/github-markdown-css"
+
+if [[ ! -f "$CSS_FILE" ]]; then
+    echo "Fetching latest github-markdown-css release..." >&2
+    LATEST_TAG=$(
+        curl -fsSL "https://api.github.com/repos/${CSS_REPO}/releases/latest" \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
+            | head -n1
+    )
+    if [[ -z "${LATEST_TAG:-}" ]]; then
+        echo "Error: could not determine latest release tag for ${CSS_REPO}" >&2
+        exit 1
+    fi
+    URL="https://raw.githubusercontent.com/${CSS_REPO}/${LATEST_TAG}/github-markdown.css"
+    echo "Downloading ${URL}" >&2
+    curl -fsSL "$URL" -o "$CSS_FILE"
+fi
+
+MERMAID_FILE="$CACHE_DIR/mermaid.min.js"
+MERMAID_REPO="mermaid-js/mermaid"
+
+if [[ ! -f "$MERMAID_FILE" ]]; then
+    echo "Fetching latest mermaid release..." >&2
+    # The mermaid-js/mermaid repo is a monorepo; filter for tags starting with "mermaid@".
+    MERMAID_TAG=$(
+        curl -fsSL "https://api.github.com/repos/${MERMAID_REPO}/releases?per_page=50" \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
+            | grep '^mermaid@' \
+            | head -n1
+    )
+    if [[ -z "${MERMAID_TAG:-}" ]]; then
+        echo "Error: could not determine latest release tag for ${MERMAID_REPO}" >&2
+        exit 1
+    fi
+    MERMAID_VER=${MERMAID_TAG#mermaid@}
+    URL="https://cdn.jsdelivr.net/npm/mermaid@${MERMAID_VER}/dist/mermaid.min.js"
+    echo "Downloading mermaid@${MERMAID_VER} from jsDelivr..." >&2
+    curl -fsSL "$URL" -o "$MERMAID_FILE"
+fi
+
+# Honors $TMPDIR (i.e. /var/folders/... on macOS, auto-cleaned by the OS).
+TMP_DIR=$(mktemp -d -t mdview)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+    # Expand a leading ~ and resolve relative paths against $PWD.
+    OUTPUT_DIR=${OUTPUT_DIR/#\~/$HOME}
+    [[ "$OUTPUT_DIR" != /* ]] && OUTPUT_DIR="$PWD/$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+    OUT_DIR=$OUTPUT_DIR
+else
+    OUT_DIR="$TMP_DIR/site"
+    mkdir -p "$OUT_DIR"
+fi
+# Symlink cached assets into the site dir so pages can reference them with
+# clean relative paths (e.g. "../github-markdown.css") instead of leaking
+# absolute filesystem paths into the HTML source. -sfn lets us re-export
+# into the same OUTPUT_DIR repeatedly without stale-symlink errors.
+ln -sfn "$CSS_FILE"     "$OUT_DIR/github-markdown.css"
+ln -sfn "$MERMAID_FILE" "$OUT_DIR/mermaid.min.js"
+
+HEADER_FILE="$TMP_DIR/header.html"
+BEFORE_FILE="$TMP_DIR/before.html"
+AFTER_FILE="$TMP_DIR/after.html"
+LUA_FILTER="$TMP_DIR/mdlinks.lua"
+MERMAID_HEADER_TEMPLATE="$TMP_DIR/mermaid-header.tpl.html"
+
+cat >"$MERMAID_HEADER_TEMPLATE" <<'EOF'
+<script src="__MERMAID_SRC__"></script>
+<style>
+  .mermaid { position: relative; }
+  .mermaid .mdview-svg-dl {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    color: var(--fgColor-muted, #59636e);
+    background: var(--bgColor-default, #ffffff);
+    border: 1px solid var(--borderColor-default, #d1d9e0);
+    border-radius: 6px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .15s ease-in-out, color .15s ease-in-out;
+  }
+  .mermaid:hover .mdview-svg-dl,
+  .mermaid .mdview-svg-dl:focus,
+  .mermaid .mdview-svg-dl.downloaded { opacity: 1; }
+  .mermaid .mdview-svg-dl:hover { color: var(--fgColor-accent, #0969da); }
+  .mermaid .mdview-svg-dl.downloaded { color: var(--fgColor-success, #1a7f37); }
+  .mermaid .mdview-svg-dl svg { fill: currentColor; display: block; }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    // Find pandoc-emitted mermaid code blocks and convert them to <div class="mermaid">.
+    document.querySelectorAll('pre.mermaid, code.mermaid, code.language-mermaid').forEach(function (el) {
+      var pre = el.tagName === 'PRE' ? el : el.closest('pre');
+      if (!pre) return;
+      var text = (el.textContent || pre.textContent).replace(/\n$/, '');
+      var wrapper = pre.parentElement;
+      var target = wrapper && wrapper.classList && wrapper.classList.contains('sourceCode') ? wrapper : pre;
+      var div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = text;
+      target.replaceWith(div);
+    });
+    if (!window.mermaid) return;
+    mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+
+    var DOWNLOAD_SVG = '<svg aria-hidden="true" height="16" width="16" viewBox="0 0 16 16"><path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14Z"/><path d="M7.25 7.689V2a.75.75 0 0 1 1.5 0v5.689l1.97-1.969a.749.749 0 1 1 1.06 1.06l-3.25 3.25a.749.749 0 0 1-1.06 0L4.22 6.78a.749.749 0 1 1 1.06-1.06Z"/></svg>';
+    var CHECK_SVG_DL = '<svg aria-hidden="true" height="16" width="16" viewBox="0 0 16 16"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>';
+
+    function decorate() {
+      document.querySelectorAll('.mermaid').forEach(function (div, idx) {
+        if (div.querySelector(':scope > .mdview-svg-dl')) return;
+        var svg = div.querySelector(':scope > svg');
+        if (!svg) return;
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'mdview-svg-dl';
+        btn.title = 'Download SVG';
+        btn.setAttribute('aria-label', 'Download SVG');
+        btn.innerHTML = DOWNLOAD_SVG;
+        btn.addEventListener('click', function () {
+          var clone = svg.cloneNode(true);
+          if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+          if (!clone.getAttribute('xmlns:xlink')) clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+          var xml = new XMLSerializer().serializeToString(clone);
+          var blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n' + xml],
+                              { type: 'image/svg+xml;charset=utf-8' });
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = 'diagram-' + (idx + 1) + '.svg';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+          btn.classList.add('downloaded');
+          btn.innerHTML = CHECK_SVG_DL;
+          setTimeout(function () {
+            btn.classList.remove('downloaded');
+            btn.innerHTML = DOWNLOAD_SVG;
+          }, 1500);
+        });
+        div.appendChild(btn);
+      });
+    }
+
+    var result = mermaid.run();
+    if (result && typeof result.then === 'function') {
+      result.then(decorate).catch(decorate);
+    } else {
+      // Older mermaid versions render synchronously.
+      decorate();
+    }
+  });
+</script>
+EOF
+
+cat >"$HEADER_FILE" <<'HTML'
+<style>
+  body { box-sizing: border-box; max-width: 980px; margin: 0 auto; padding: 32px; transition: max-width .2s ease; }
+  body.wide { max-width: none; }
+  .markdown-body { box-sizing: border-box; }
+
+  #width-toggle {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fgColor-muted, #59636e);
+    background: var(--bgColor-default, #ffffff);
+    border: 1px solid var(--borderColor-default, #d1d9e0);
+    border-radius: 6px;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity .15s;
+  }
+  #width-toggle:hover { opacity: 1; }
+  #width-toggle svg { fill: currentColor; flex-shrink: 0; }
+
+  /* Diff modal */
+  #mdview-diff-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0,0,0,.45);
+    align-items: center;
+    justify-content: center;
+  }
+  #mdview-diff-overlay.open { display: flex; }
+  #mdview-diff-box {
+    background: var(--bgColor-default, #ffffff);
+    border: 1px solid var(--borderColor-default, #d1d9e0);
+    border-radius: 10px;
+    width: min(900px, 90vw);
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,.2);
+  }
+  #mdview-diff-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--borderColor-default, #d1d9e0);
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--fgColor-default, #1f2328);
+    flex-shrink: 0;
+  }
+  #mdview-diff-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--fgColor-muted, #59636e);
+    padding: 2px;
+    display: flex;
+    align-items: center;
+    border-radius: 4px;
+  }
+  #mdview-diff-close:hover { color: var(--fgColor-default, #1f2328); }
+  #mdview-diff-body {
+    overflow-y: auto;
+    padding: 16px;
+    flex: 1;
+  }
+  #mdview-diff-body pre { margin: 0; }
+  /* GitHub-style colours for skylighting's diff classes (va=+, st=-, dt=@@, kw=file header). */
+  #mdview-diff-body .va { color: #1a7f37; background: #dafbe1; }
+  #mdview-diff-body .st { color: #d1242f; background: #ffebe9; }
+  #mdview-diff-body .dt { color: #6639ba; font-weight: 600; }
+  #mdview-diff-body .kw { color: #57606a; font-weight: 600; }
+
+  /* Table of contents sidebar */
+  #mdview-toc {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 280px;
+    height: 100vh;
+    background: var(--bgColor-default, #ffffff);
+    border-left: 1px solid var(--borderColor-default, #d1d9e0);
+    transform: translateX(100%);
+    transition: transform .2s ease;
+    z-index: 9998;
+    overflow-y: auto;
+    padding: 16px 8px 16px 16px;
+    box-sizing: border-box;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    box-shadow: -2px 0 8px rgba(0,0,0,.04);
+  }
+  #mdview-toc.open { transform: translateX(0); }
+  #mdview-toc-title {
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--fgColor-muted, #59636e);
+    margin: 0 0 10px 8px;
+  }
+  #mdview-toc a {
+    display: block;
+    padding: 3px 8px;
+    color: var(--fgColor-default, #1f2328);
+    text-decoration: none;
+    border-left: 2px solid transparent;
+    border-radius: 0 4px 4px 0;
+    line-height: 1.35;
+  }
+  #mdview-toc a:hover { background: var(--bgColor-muted, #f6f8fa); }
+  #mdview-toc a.active {
+    color: var(--fgColor-accent, #0969da);
+    background: var(--bgColor-accent-muted, #ddf4ff);
+    border-left-color: var(--fgColor-accent, #0969da);
+    font-weight: 600;
+  }
+
+  /* GitHub-style copy icon on every <pre> code block. */
+  .markdown-body pre { position: relative; }
+  .markdown-body pre .copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    color: var(--fgColor-muted, #59636e);
+    background: var(--bgColor-default, #ffffff);
+    border: 1px solid var(--borderColor-default, #d1d9e0);
+    border-radius: 6px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .15s ease-in-out, color .15s ease-in-out;
+  }
+  .markdown-body pre:hover .copy-btn,
+  .markdown-body pre .copy-btn:focus,
+  .markdown-body pre .copy-btn.copied { opacity: 1; }
+  .markdown-body pre .copy-btn:hover { color: var(--fgColor-accent, #0969da); }
+  .markdown-body pre .copy-btn.copied { color: var(--fgColor-success, #1a7f37); }
+  .markdown-body pre .copy-btn .octicon { fill: currentColor; display: block; }
+  .markdown-body pre .copy-btn .octicon-check { display: none; }
+  .markdown-body pre .copy-btn.copied .octicon-copy  { display: none; }
+  .markdown-body pre .copy-btn.copied .octicon-check { display: block; }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    var COPY_SVG  = '<svg class="octicon octicon-copy"  aria-hidden="true" height="16" width="16" viewBox="0 0 16 16" version="1.1"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>';
+    var CHECK_SVG = '<svg class="octicon octicon-check" aria-hidden="true" height="16" width="16" viewBox="0 0 16 16" version="1.1"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>';
+
+    // Width toggle button
+    var wide = localStorage.getItem('mdview-wide') === '1';
+    if (wide) document.body.classList.add('wide');
+    var toggle = document.createElement('button');
+    toggle.id = 'width-toggle';
+    toggle.title = 'Toggle reading width (w)';
+    toggle.setAttribute('data-hotkey', 'w');
+    toggle.setAttribute('data-hotkey-label', 'Toggle wide / narrow');
+    var NARROW_SVG = '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M3 8a.75.75 0 0 1 .75-.75h8.5a.75.75 0 0 1 0 1.5h-8.5A.75.75 0 0 1 3 8ZM1 3.75A.75.75 0 0 1 1.75 3h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 3.75Zm0 8.5A.75.75 0 0 1 1.75 11h12.5a.75.75 0 0 1 0 1.5H1.75a.75.75 0 0 1-.75-.75Z"/></svg>';
+    var WIDE_SVG   = '<svg width="16" height="16" viewBox="0 0 16 16"><path d="M1 3.75A.75.75 0 0 1 1.75 3h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 3.75ZM1 8a.75.75 0 0 1 .75-.75h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 8Zm0 4.25A.75.75 0 0 1 1.75 11h12.5a.75.75 0 0 1 0 1.5H1.75a.75.75 0 0 1-.75-.75Z"/></svg>';
+    function updateToggle() {
+      var isWide = document.body.classList.contains('wide');
+      toggle.innerHTML = (isWide ? NARROW_SVG : WIDE_SVG) + (isWide ? ' Narrow' : ' Wide');
+    }
+    updateToggle();
+    toggle.addEventListener('click', function () {
+      document.body.classList.toggle('wide');
+      localStorage.setItem('mdview-wide', document.body.classList.contains('wide') ? '1' : '0');
+      updateToggle();
+    });
+    document.body.appendChild(toggle);
+
+    // Diff modal button (only rendered when --diff produced content)
+    var diffContent = document.getElementById('mdview-diff-modal-content');
+    if (diffContent) {
+      var DIFF_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8.75 1.75a.75.75 0 0 0-1.5 0V7H1.75a.75.75 0 0 0 0 1.5H7.25v5.25a.75.75 0 0 0 1.5 0V8.5h5.25a.75.75 0 0 0 0-1.5H8.75V1.75Z"/></svg>';
+      var CLOSE_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>';
+
+      // Overlay + box
+      var overlay = document.createElement('div');
+      overlay.id = 'mdview-diff-overlay';
+      var box = document.createElement('div');
+      box.id = 'mdview-diff-box';
+      var titlebar = document.createElement('div');
+      titlebar.id = 'mdview-diff-titlebar';
+      titlebar.innerHTML = '<span>Git diff</span>';
+      var closeBtn = document.createElement('button');
+      closeBtn.id = 'mdview-diff-close';
+      closeBtn.innerHTML = CLOSE_SVG;
+      closeBtn.setAttribute('aria-label', 'Close');
+      titlebar.appendChild(closeBtn);
+      var body = document.createElement('div');
+      body.id = 'mdview-diff-body';
+      body.innerHTML = diffContent.innerHTML;
+      box.appendChild(titlebar);
+      box.appendChild(body);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      function openModal()  { overlay.classList.add('open'); }
+      function closeModal() { overlay.classList.remove('open'); }
+      closeBtn.addEventListener('click', closeModal);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
+      // Trigger button (sits next to the width toggle)
+      var diffBtn = document.createElement('button');
+      diffBtn.id = 'width-toggle'; // reuse same style class
+      diffBtn.style.bottom = '52px'; // stack above width toggle
+      diffBtn.title = 'Show git diff (d)';
+      diffBtn.setAttribute('data-hotkey', 'd');
+      diffBtn.setAttribute('data-hotkey-label', 'Show git diff');
+      diffBtn.innerHTML = DIFF_SVG + ' Diff';
+      diffBtn.addEventListener('click', openModal);
+      document.body.appendChild(diffBtn);
+    }
+
+    // Links modal
+    (function () {
+      var LINK_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.775 3.275a.75.75 0 0 0 1.06 1.06l1.25-1.25a2 2 0 1 1 2.83 2.83l-2.5 2.5a2 2 0 0 1-2.83 0 .75.75 0 0 0-1.06 1.06 3.5 3.5 0 0 0 4.95 0l2.5-2.5a3.5 3.5 0 0 0-4.95-4.95l-1.25 1.25Zm-4.69 9.64a2 2 0 0 1 0-2.83l2.5-2.5a2 2 0 0 1 2.83 0 .75.75 0 0 0 1.06-1.06 3.5 3.5 0 0 0-4.95 0l-2.5 2.5a3.5 3.5 0 0 0 4.95 4.95l1.25-1.25a.75.75 0 0 0-1.06-1.06l-1.25 1.25a2 2 0 0 1-2.83 0Z"/></svg>';
+
+      // Collect links
+      var counts = {}, types = {};
+      document.querySelectorAll('.markdown-body a[href]').forEach(function (a) {
+        var href = a.getAttribute('href');
+        if (!href || href.startsWith('#')) return;
+        counts[href] = (counts[href] || 0) + 1;
+        if (!(href in types)) {
+          types[href] = /^(https?|mailto|ftp):/.test(href) ? 'external' : 'local';
+        }
+      });
+
+      var external = [], local = [];
+      Object.keys(counts).forEach(function (href) {
+        (types[href] === 'external' ? external : local).push({ href: href, n: counts[href] });
+      });
+      var cmp = function (a, b) { return b.n - a.n || a.href.localeCompare(b.href); };
+      external.sort(cmp); local.sort(cmp);
+
+      var total = external.length + local.length;
+
+      // Build modal HTML
+      function renderSection(title, items) {
+        if (!items.length) return '';
+        var rows = items.map(function (it) {
+          var badge = it.n > 1 ? ' <span style="display:inline-block;min-width:20px;padding:1px 6px;font-size:11px;font-weight:600;line-height:1.6;border-radius:10px;background:var(--bgColor-neutral-muted,#818b981f);color:var(--fgColor-muted,#59636e);text-align:center;">' + it.n + '</span>' : '';
+          return '<tr><td style="padding:4px 8px 4px 0;word-break:break-all;"><a href="' + it.href + '" style="color:var(--fgColor-accent,#0969da);">' + it.href + '</a></td><td style="padding:4px 0;white-space:nowrap;">' + badge + '</td></tr>';
+        }).join('');
+        return '<p style="font-weight:600;font-size:13px;color:var(--fgColor-muted,#59636e);margin:0 0 6px;">' + title + '</p><table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">' + rows + '</table>';
+      }
+
+      var modalBody = renderSection('External (' + external.length + ')', external) +
+                      renderSection('Local (' + local.length + ')', local);
+      if (!modalBody) modalBody = '<p style="color:var(--fgColor-muted,#59636e);">No links found.</p>';
+
+      // Overlay
+      var overlay = document.createElement('div');
+      overlay.id = 'mdview-links-overlay';
+      overlay.style.cssText = 'display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.45);align-items:center;justify-content:center;';
+      var box = document.createElement('div');
+      box.style.cssText = 'background:var(--bgColor-default,#fff);border:1px solid var(--borderColor-default,#d1d9e0);border-radius:10px;width:min(760px,90vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.2);';
+      var titlebar = document.createElement('div');
+      titlebar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-weight:600;font-size:14px;flex-shrink:0;';
+      titlebar.innerHTML = '<span>Links (' + total + ')</span>';
+      var closeBtn = document.createElement('button');
+      closeBtn.id = 'mdview-diff-close';
+      closeBtn.setAttribute('aria-label', 'Close');
+      closeBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>';
+      titlebar.appendChild(closeBtn);
+      var body = document.createElement('div');
+      body.style.cssText = 'overflow-y:auto;padding:16px;flex:1;';
+      body.innerHTML = modalBody;
+      box.appendChild(titlebar); box.appendChild(body);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      function openModal()  { overlay.style.display = 'flex'; }
+      function closeModal() { overlay.style.display = 'none'; }
+      closeBtn.addEventListener('click', closeModal);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
+      // How many buttons already exist — stack above them
+      var stackIdx = document.querySelectorAll('[id="width-toggle"]').length;
+      var linksBtn = document.createElement('button');
+      linksBtn.id = 'width-toggle';
+      linksBtn.style.bottom = (16 + stackIdx * 36) + 'px';
+      linksBtn.title = 'Show links (l)';
+      linksBtn.setAttribute('data-hotkey', 'l');
+      linksBtn.setAttribute('data-hotkey-label', 'Show links');
+      linksBtn.innerHTML = LINK_SVG + ' Links';
+      linksBtn.addEventListener('click', openModal);
+      document.body.appendChild(linksBtn);
+    }());
+
+    // Table of contents sidebar
+    (function () {
+      var TOC_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 4a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm3.75-1.5a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5h-8.5Zm0 5a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5h-8.5Zm0 5a.75.75 0 0 0 0 1.5h8.5a.75.75 0 0 0 0-1.5h-8.5ZM3 8a1 1 0 1 1-2 0 1 1 0 0 1 2 0Zm-1 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>';
+
+      var headings = document.querySelectorAll(
+        '.markdown-body h1:not(.title), .markdown-body h2, .markdown-body h3, ' +
+        '.markdown-body h4, .markdown-body h5, .markdown-body h6');
+      if (!headings.length) return;
+
+      // Ensure every heading has an id (pandoc gfm usually adds one).
+      var slug = 0;
+      headings.forEach(function (h) {
+        if (!h.id) h.id = 'mdview-h-' + (++slug);
+      });
+
+      // Build flat sidebar list with per-level indentation.
+      var html = '<p id="mdview-toc-title">On this page</p>';
+      headings.forEach(function (h) {
+        var level = parseInt(h.tagName.slice(1), 10);
+        var indent = 8 + (level - 1) * 12;
+        html += '<a href="#' + h.id + '" data-toc-target="' + h.id + '" style="padding-left:' + indent + 'px;">' +
+                h.textContent + '</a>';
+      });
+
+      var toc = document.createElement('nav');
+      toc.id = 'mdview-toc';
+      toc.innerHTML = html;
+      document.body.appendChild(toc);
+
+      // Persist open/closed state
+      if (localStorage.getItem('mdview-toc') === '1') toc.classList.add('open');
+
+      function isOpen()    { return toc.classList.contains('open'); }
+      function openToc()   { toc.classList.add('open');    localStorage.setItem('mdview-toc', '1'); }
+      function closeToc()  { toc.classList.remove('open'); localStorage.setItem('mdview-toc', '0'); }
+      function toggleToc() { isOpen() ? closeToc() : openToc(); }
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && isOpen()) closeToc();
+      });
+
+      // Scroll-spy: highlight the heading nearest the top of the viewport
+      var links = toc.querySelectorAll('a[data-toc-target]');
+      var linkById = {};
+      links.forEach(function (l) { linkById[l.getAttribute('data-toc-target')] = l; });
+
+      var visible = new Set();
+      var observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) visible.add(e.target.id);
+          else visible.delete(e.target.id);
+        });
+        // Pick the topmost visible heading in document order
+        var first = null, firstTop = Infinity;
+        visible.forEach(function (id) {
+          var h = document.getElementById(id);
+          if (!h) return;
+          var top = h.getBoundingClientRect().top;
+          if (top < firstTop) { firstTop = top; first = id; }
+        });
+        if (first && linkById[first]) {
+          links.forEach(function (l) { l.classList.remove('active'); });
+          linkById[first].classList.add('active');
+          if (isOpen()) linkById[first].scrollIntoView({ block: 'nearest' });
+        }
+      }, { rootMargin: '0px 0px -60% 0px', threshold: 0 });
+      headings.forEach(function (h) { observer.observe(h); });
+
+      // Toggle button — stacks above the others
+      var stackIdx = document.querySelectorAll('[id="width-toggle"]').length;
+      var tocBtn = document.createElement('button');
+      tocBtn.id = 'width-toggle';
+      tocBtn.style.bottom = (16 + stackIdx * 36) + 'px';
+      tocBtn.title = 'Toggle table of contents (t)';
+      tocBtn.setAttribute('data-hotkey', 't');
+      tocBtn.setAttribute('data-hotkey-label', 'Toggle table of contents');
+      tocBtn.innerHTML = TOC_SVG + ' TOC';
+      tocBtn.addEventListener('click', toggleToc);
+      document.body.appendChild(tocBtn);
+    }());
+
+    // Raw source modal — shows the original markdown for the current
+    // selection. Only present when the page was rendered with --raw
+    // (embeds a <script id="mdview-source" type="text/markdown">).
+    (function () {
+      var srcEl = document.getElementById('mdview-source');
+      if (!srcEl) return;
+      var RAW_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1.5a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 10 4.25V1.5Zm9.75.5.5 3.25a.25.25 0 0 0 .25.25h2.75L11.5 2ZM0 1.75C0 .784.784 0 1.75 0h9.586a1.5 1.5 0 0 1 1.06.44l3.415 3.414a1.5 1.5 0 0 1 .439 1.06v9.336A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Z"/></svg>';
+      var CLOSE_SVG_R = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>';
+
+      // The embedded source keeps its original bytes but has any closing
+      // script tag escaped with a backslash. Undo that escape when reading.
+      var source = srcEl.textContent.replace(/<\\\/([sS][cC][rR][iI][pP][tT])/g, '</$1');
+
+      // Precompute line-start byte offsets so we can turn a
+      // "line:col" pair into a character index in O(log n).
+      var lineStarts = [0];
+      for (var i = 0; i < source.length; i++) {
+        if (source.charCodeAt(i) === 10) lineStarts.push(i + 1);
+      }
+      function offsetOf(line, col) {
+        // pandoc positions are 1-based. Column is a character offset within
+        // the line (1 = start of line). Clamp to sane bounds.
+        if (line < 1) line = 1;
+        var idx = Math.min(line - 1, lineStarts.length - 1);
+        var base = lineStarts[idx];
+        var lineEnd = idx + 1 < lineStarts.length ? lineStarts[idx + 1] - 1 : source.length;
+        return Math.min(base + Math.max(0, col - 1), lineEnd);
+      }
+
+      // Parse a data-pos value like "path@L:C-L:C" (or "L:C-L:C" without
+      // path). Returns [startLine, startCol, endLine, endCol] or null.
+      function parsePos(v) {
+        if (!v) return null;
+        var at = v.lastIndexOf('@');
+        var range = at >= 0 ? v.slice(at + 1) : v;
+        var m = /^(\d+):(\d+)-(\d+):(\d+)$/.exec(range);
+        if (!m) return null;
+        return [+m[1], +m[2], +m[3], +m[4]];
+      }
+
+      // Walk up from a node until we hit an element with data-pos.
+      function ancestorWithPos(node) {
+        if (!node) return null;
+        if (node.nodeType === 3) node = node.parentNode;
+        while (node && node !== document.body) {
+          if (node.nodeType === 1 && node.hasAttribute('data-pos')) return node;
+          node = node.parentNode;
+        }
+        return null;
+      }
+
+      // For a Range, produce a [startOffset, endOffset] slice into `source`
+      // covering everything the user selected. We union the source ranges of
+      // the nearest data-pos ancestors of the range's endpoints.
+      function rangeToSourceOffsets(range) {
+        var a = ancestorWithPos(range.startContainer);
+        var b = ancestorWithPos(range.endContainer);
+        if (!a && !b) return null;
+        var pa = a && parsePos(a.getAttribute('data-pos'));
+        var pb = b && parsePos(b.getAttribute('data-pos'));
+        if (!pa && !pb) return null;
+        if (!pa) pa = pb;
+        if (!pb) pb = pa;
+        var startOff = Math.min(offsetOf(pa[0], pa[1]), offsetOf(pb[0], pb[1]));
+        var endOff   = Math.max(offsetOf(pa[2], pa[3]), offsetOf(pb[2], pb[3]));
+        return [startOff, endOff];
+      }
+
+      function currentRawSlice() {
+        var sel = window.getSelection && window.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+        var range = sel.getRangeAt(0);
+        var off = rangeToSourceOffsets(range);
+        if (!off) return null;
+        return source.slice(off[0], off[1]).replace(/\s+$/, '');
+      }
+
+      // Build modal
+      var overlay = document.createElement('div');
+      overlay.id = 'mdview-raw-overlay';
+      overlay.style.cssText = 'display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.45);align-items:center;justify-content:center;';
+      var box = document.createElement('div');
+      box.style.cssText = 'background:var(--bgColor-default,#fff);border:1px solid var(--borderColor-default,#d1d9e0);border-radius:10px;width:min(900px,90vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.2);';
+      var titlebar = document.createElement('div');
+      titlebar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-weight:600;font-size:14px;flex-shrink:0;';
+      titlebar.innerHTML = '<span>Raw markdown</span>';
+      var btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;align-items:center;gap:6px;';
+      var copyBtn = document.createElement('button');
+      copyBtn.setAttribute('aria-label', 'Copy to clipboard');
+      copyBtn.title = 'Copy';
+      copyBtn.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:3px 8px;font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--fgColor-muted,#59636e);background:var(--bgColor-default,#fff);border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;cursor:pointer;';
+      copyBtn.innerHTML = COPY_SVG + '<span>Copy</span>';
+      btnRow.appendChild(copyBtn);
+      var closeBtn = document.createElement('button');
+      closeBtn.id = 'mdview-diff-close';
+      closeBtn.setAttribute('aria-label', 'Close');
+      closeBtn.innerHTML = CLOSE_SVG_R;
+      btnRow.appendChild(closeBtn);
+      titlebar.appendChild(btnRow);
+
+      function copyRaw() {
+        var text = pre.textContent;
+        var ok = function () {
+          copyBtn.innerHTML = CHECK_SVG + '<span>Copied</span>';
+          copyBtn.style.color = 'var(--fgColor-success,#1a7f37)';
+          setTimeout(function () {
+            copyBtn.innerHTML = COPY_SVG + '<span>Copy</span>';
+            copyBtn.style.color = 'var(--fgColor-muted,#59636e)';
+          }, 1500);
+        };
+        var fail = function () {
+          copyBtn.title = 'Copy failed';
+          setTimeout(function () { copyBtn.title = 'Copy'; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(ok, fail);
+        } else {
+          var ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand('copy'); ok(); } catch (e) { fail(); }
+          document.body.removeChild(ta);
+        }
+      }
+      copyBtn.addEventListener('click', copyRaw);
+      var body = document.createElement('div');
+      body.style.cssText = 'overflow:auto;padding:16px;flex:1;';
+      var pre = document.createElement('pre');
+      pre.style.cssText = 'margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-word;background:var(--bgColor-muted,#f6f8fa);padding:12px 14px;border-radius:6px;';
+      body.appendChild(pre);
+      box.appendChild(titlebar); box.appendChild(body);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      function closeModal() { overlay.style.display = 'none'; }
+      function isOpen()     { return overlay.style.display === 'flex'; }
+      function openModal()  {
+        var slice = currentRawSlice();
+        pre.textContent = slice != null ? slice : source;
+        overlay.style.display = 'flex';
+      }
+      closeBtn.addEventListener('click', closeModal);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) closeModal(); });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && isOpen()) closeModal();
+      });
+
+      var stackIdx = document.querySelectorAll('[id="width-toggle"]').length;
+      var rawBtn = document.createElement('button');
+      rawBtn.id = 'width-toggle';
+      rawBtn.style.bottom = (16 + stackIdx * 36) + 'px';
+      rawBtn.title = 'Show raw markdown for selection (r)';
+      rawBtn.setAttribute('data-hotkey', 'r');
+      rawBtn.setAttribute('data-hotkey-label', 'Show raw markdown for selection');
+      rawBtn.innerHTML = RAW_SVG + ' Raw';
+      rawBtn.addEventListener('click', openModal);
+      document.body.appendChild(rawBtn);
+    }());
+
+    // Help modal + global hotkeys
+    (function () {
+      var HELP_CLOSE_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"/></svg>';
+
+      // Discover all hotkey-bearing buttons that were registered above.
+      var registered = Array.prototype.slice.call(document.querySelectorAll('[data-hotkey]'));
+      var hotkeyMap = {};
+      registered.forEach(function (btn) {
+        hotkeyMap[btn.getAttribute('data-hotkey')] = btn;
+      });
+
+      function kbd(k) {
+        return '<kbd style="padding:2px 7px;border:1px solid var(--borderColor-default,#d1d9e0);border-bottom-width:2px;border-radius:4px;background:var(--bgColor-muted,#f6f8fa);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;font-weight:600;color:var(--fgColor-default,#1f2328);">' + k + '</kbd>';
+      }
+      function row(k, label) {
+        return '<tr><td style="padding:6px 16px 6px 0;text-align:right;width:1%;white-space:nowrap;">' + kbd(k) + '</td><td style="padding:6px 0;color:var(--fgColor-default,#1f2328);">' + label + '</td></tr>';
+      }
+
+      var rows = registered.map(function (btn) {
+        return row(btn.getAttribute('data-hotkey'), btn.getAttribute('data-hotkey-label') || btn.title || '');
+      }).join('') + row('?', 'Show this help') + row('Esc', 'Close any open modal');
+
+      var overlay = document.createElement('div');
+      overlay.id = 'mdview-help-overlay';
+      overlay.style.cssText = 'display:none;position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,.45);align-items:center;justify-content:center;';
+      var box = document.createElement('div');
+      box.style.cssText = 'background:var(--bgColor-default,#fff);border:1px solid var(--borderColor-default,#d1d9e0);border-radius:10px;width:min(420px,90vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.2);';
+      var titlebar = document.createElement('div');
+      titlebar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-weight:600;font-size:14px;flex-shrink:0;';
+      titlebar.innerHTML = '<span>Keyboard shortcuts</span>';
+      var closeBtn = document.createElement('button');
+      closeBtn.id = 'mdview-diff-close';
+      closeBtn.setAttribute('aria-label', 'Close');
+      closeBtn.innerHTML = HELP_CLOSE_SVG;
+      titlebar.appendChild(closeBtn);
+      var body = document.createElement('div');
+      body.style.cssText = 'overflow-y:auto;padding:16px;flex:1;';
+      body.innerHTML = '<table style="border-collapse:collapse;font-size:14px;">' + rows + '</table>';
+      box.appendChild(titlebar); box.appendChild(body);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      function openHelp()  { overlay.style.display = 'flex'; }
+      function closeHelp() { overlay.style.display = 'none'; }
+      closeBtn.addEventListener('click', closeHelp);
+      overlay.addEventListener('click', function (e) { if (e.target === overlay) closeHelp(); });
+
+      // Global keydown handler
+      document.addEventListener('keydown', function (e) {
+        var t = e.target;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        if (e.key === 'Escape') { closeHelp(); return; }
+        if (e.key === '?') { e.preventDefault(); openHelp(); return; }
+        var btn = hotkeyMap[e.key];
+        if (btn) { e.preventDefault(); btn.click(); }
+      });
+    }());
+
+    document.querySelectorAll('.markdown-body pre').forEach(function (pre) {
+      if (pre.querySelector('.copy-btn')) return;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'copy-btn';
+      btn.setAttribute('aria-label', 'Copy code to clipboard');
+      btn.title = 'Copy';
+      btn.innerHTML = COPY_SVG + CHECK_SVG;
+      btn.addEventListener('click', function () {
+        var code = pre.querySelector('code');
+        var text = (code ? code.innerText : pre.innerText).replace(/\n$/, '');
+        var done = function () {
+          btn.classList.add('copied');
+          btn.title = 'Copied!';
+          btn.setAttribute('aria-label', 'Copied!');
+          setTimeout(function () {
+            btn.classList.remove('copied');
+            btn.title = 'Copy';
+            btn.setAttribute('aria-label', 'Copy code to clipboard');
+          }, 1500);
+        };
+        var fail = function () {
+          btn.title = 'Copy failed';
+          setTimeout(function () { btn.title = 'Copy'; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, fail);
+        } else {
+          var ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand('copy'); done(); } catch (e) { fail(); }
+          document.body.removeChild(ta);
+        }
+      });
+      pre.appendChild(btn);
+    });
+  });
+</script>
+HTML
+printf '%s' '<article class="markdown-body">' >"$BEFORE_FILE"
+printf '%s' '</article>' >"$AFTER_FILE"
+
+# Pandoc Lua filter:
+#   * Rewrite local *.md / *.markdown links to *.html so rendered pages can
+#     navigate between each other in --all mode.
+#   * Rewrite relative <img src> and relative non-md links to absolute paths
+#     that point back into the source tree, so images and other referenced
+#     assets (yaml, pdf, svg, ...) resolve correctly from the output dir.
+# External URLs (http, mailto, etc.), pure fragments and absolute paths are
+# left untouched. Suffixes (#frag, ?query) are preserved.
+cat >"$LUA_FILTER" <<'LUA'
+-- Directory of the current input file, derived once at load time from
+-- PANDOC_STATE. Used to turn relative <img>/<a> paths into absolute paths
+-- so referenced assets resolve from the output dir.
+local srcdir = ""
+if PANDOC_STATE and PANDOC_STATE.input_files and PANDOC_STATE.input_files[1] then
+  local input = PANDOC_STATE.input_files[1]
+  srcdir = input:match("^(.*)/[^/]+$") or ""
+end
+
+local function is_external(target)
+  if target == nil or target == "" then return true end
+  if target:match("^%a[%w+.-]*://") then return true end
+  if target:match("^mailto:") then return true end
+  if target:match("^#") then return true end
+  if target:sub(1, 1) == "/" then return true end
+  return false
+end
+
+local function absolutize(target)
+  if srcdir == "" then return target end
+  local path, suffix = target:match("^([^#?]*)(.*)$")
+  if path == "" then return target end
+  return srcdir .. "/" .. path .. suffix
+end
+
+local function rewrite_link(target)
+  if is_external(target) then return target end
+  local path, suffix = target:match("^([^#?]*)(.*)$")
+  local lower = path:lower()
+  if lower:sub(-3) == ".md" then
+    return path:sub(1, -4) .. ".html" .. suffix
+  elseif lower:sub(-9) == ".markdown" then
+    return path:sub(1, -10) .. ".html" .. suffix
+  end
+  return absolutize(target)
+end
+
+function Link(el)
+  el.target = rewrite_link(el.target)
+  return el
+end
+
+function Image(el)
+  if not is_external(el.src) then
+    el.src = absolutize(el.src)
+  end
+  return el
+end
+LUA
+
+# Resolve the entry file to an absolute path and pick the base directory.
+MD_DIR_ABS=$(cd "$(dirname "$MD_FILE")" && pwd)
+MD_FILE_ABS="$MD_DIR_ABS/$(basename "$MD_FILE")"
+
+if $ALL; then
+    if [[ -n "$ROOT_DIR" ]]; then
+        [[ -d "$ROOT_DIR" ]] || { echo "Error: --root dir does not exist: $ROOT_DIR" >&2; exit 1; }
+        BASE_DIR=$(cd "$ROOT_DIR" && pwd)
+    else
+        BASE_DIR=$(pwd)
+    fi
+    case "$MD_FILE_ABS/" in
+        "$BASE_DIR/"*) ;;
+        *)
+            echo "Error: $MD_FILE is not inside the root directory: $BASE_DIR" >&2
+            echo "Hint: cd into a parent directory of the file, or pass --root <dir>." >&2
+            exit 1
+            ;;
+    esac
+else
+    BASE_DIR=$MD_DIR_ABS
+fi
+
+# (Re)collect the list of markdown files to render into MD_FILES. Called once
+# up front, and again on every watch cycle so files added or removed under
+# BASE_DIR after startup are picked up.
+collect_md_files() {
+    MD_FILES=()
+    if $ALL; then
+        while IFS= read -r -d '' f; do
+            MD_FILES+=("$f")
+        done < <(find "$BASE_DIR" -type f \( -iname '*.md' -o -iname '*.markdown' \) -print0)
+    else
+        MD_FILES=("$MD_FILE_ABS")
+    fi
+}
+collect_md_files
+
+# Pure-bash relative path: relpath <target> <base>  (both must be absolute)
+relpath() {
+    local target=$1 base=$2
+    # Split into slash-separated segments via IFS
+    local -a t_parts b_parts
+    IFS='/' read -ra t_parts <<< "${target#/}"
+    IFS='/' read -ra b_parts <<< "${base#/}"
+    # Drop common leading segments
+    local common=0
+    while [[ $common -lt ${#t_parts[@]} && $common -lt ${#b_parts[@]} && \
+             "${t_parts[$common]}" == "${b_parts[$common]}" ]]; do
+        (( common++ )) || true
+    done
+    # One ".." for every remaining base segment
+    local rel=""
+    local i
+    for (( i=common; i<${#b_parts[@]}; i++ )); do
+        rel="${rel:+$rel/}.."
+    done
+    # Append remaining target segments
+    for (( i=common; i<${#t_parts[@]}; i++ )); do
+        rel="${rel:+$rel/}${t_parts[$i]}"
+    done
+    echo "${rel:-.}"
+}
+
+render_md() {
+    local src=$1 dst=$2 with_diff=${3:-false}
+    local dst_dir
+    dst_dir=$(dirname "$dst")
+    mkdir -p "$dst_dir"
+
+    # Compute relative paths so the page references symlinked assets cleanly.
+    local css_rel
+    css_rel=$(relpath "$OUT_DIR/github-markdown.css" "$dst_dir")
+
+    # Always apply the Lua filter: it rewrites *.md links to *.html and turns
+    # relative image/asset paths into absolute paths that point back at the
+    # source tree (so <img src="docs/foo.png"> resolves from OUT_DIR). The
+    # filter derives the source dir from PANDOC_STATE.input_files, so $src
+    # must be an absolute path when passed to pandoc (it always is here).
+    local filter_args=(--lua-filter="$LUA_FILTER")
+
+    local header_files=(-H "$HEADER_FILE")
+    # Pull in mermaid only for files that actually contain a mermaid fence.
+    # Use a per-render header file so parallel jobs don't race on writing it.
+    local mermaid_header=""
+    if grep -qE '^[[:space:]]*```mermaid([[:space:]]|$)' "$src"; then
+        local mermaid_rel
+        mermaid_rel=$(relpath "$OUT_DIR/mermaid.min.js" "$dst_dir")
+        # Note: BSD mktemp only substitutes *trailing* Xs, so the template
+        # must not carry a suffix after them. Pandoc reads -H/-A includes
+        # verbatim and ignores the extension.
+        mermaid_header=$(mktemp "$TMP_DIR/mermaid-header.XXXXXXXX")
+        sed "s|__MERMAID_SRC__|$mermaid_rel|g" "$MERMAID_HEADER_TEMPLATE" >"$mermaid_header"
+        header_files+=(-H "$mermaid_header")
+    fi
+
+    local after_files=(-A "$AFTER_FILE")
+    if [[ "$with_diff" == "true" ]]; then
+        after_files+=(-A "$DIFF_SUFFIX_FILE")
+    fi
+
+    # --raw: enable sourcepos so every element carries data-pos, and embed the
+    # raw markdown so JS can slice it on demand. Per-file after-file so each
+    # page gets its own source.
+    local from_fmt="gfm"
+    local raw_after=""
+    if $SHOW_RAW; then
+        from_fmt="gfm+sourcepos"
+        raw_after=$(mktemp "$TMP_DIR/raw-suffix.XXXXXXXX")
+        {
+            printf '<script type="text/markdown" id="mdview-source">'
+            # Escape </script> (case-insensitive) so the raw source cannot
+            # accidentally close the containing <script> tag. Also escape any
+            # standalone < that could start a tag inside a script of type
+            # text/markdown; the spec is lenient here but <\/script> is the
+            # only sequence that matters.
+            sed 's|</\([sS][cC][rR][iI][pP][tT]\)|<\\/\1|g' "$src"
+            printf '</script>'
+        } >"$raw_after"
+        after_files+=(-A "$raw_after")
+    fi
+
+    pandoc \
+        --from="$from_fmt" \
+        --to=html5 \
+        --standalone \
+        --metadata title="$(basename "$src")" \
+        --css="$css_rel" \
+        "${filter_args[@]}" \
+        "${header_files[@]}" \
+        -B "$BEFORE_FILE" \
+        "${after_files[@]}" \
+        -o "$dst" \
+        "$src"
+
+    # These are per-invocation scratch files; drop them so a long --watch
+    # session doesn't accumulate one pair per file per cycle in TMP_DIR.
+    [[ -n "$mermaid_header" ]] && rm -f "$mermaid_header"
+    [[ -n "$raw_after" ]] && rm -f "$raw_after"
+    return 0
+}
+
+DIFF_SUFFIX_FILE="$TMP_DIR/diff-suffix.html"
+
+# Rebuild the diff suffix file from the working tree's current state and echo
+# "true" if a diff was produced. Recomputed on every pass so --watch reflects
+# changes that appear or disappear (e.g. after a commit) mid-session. Never
+# touches WANT_DIFF, which is the user's --diff intent.
+build_diff_suffix() {
+    printf '' >"$DIFF_SUFFIX_FILE"
+    $WANT_DIFF || { echo false; return 0; }
+
+    if ! git -C "$MD_DIR_ABS" rev-parse --git-dir >/dev/null 2>&1; then
+        echo false
+        return 0
+    fi
+
+    local diff_output
+    diff_output=$(git -C "$MD_DIR_ABS" diff HEAD -- "$(basename "$MD_FILE_ABS")" 2>/dev/null || true)
+    if [[ -z "$diff_output" ]]; then
+        echo false
+        return 0
+    fi
+
+    # The diff may contain its own ```fenced``` blocks. Pick a fence length
+    # one longer than the longest backtick run inside the diff so it can't
+    # be accidentally closed by content.
+    local max_ticks fence_len fence diff_html
+    max_ticks=$(printf '%s' "$diff_output" | awk '
+        { run = 0; max = 0
+          for (i = 1; i <= length($0); i++) {
+              if (substr($0, i, 1) == "`") { run++; if (run > max) max = run }
+              else run = 0
+          }
+          if (max > G) G = max
+        }
+        END { print G + 0 }')
+    fence_len=$(( max_ticks > 2 ? max_ticks + 1 : 3 ))
+    fence=$(printf "%${fence_len}s" "" | tr ' ' '`')
+    # Render the diff through pandoc so Skylighting colours the +/- lines.
+    diff_html=$(printf '%sdiff\n%s\n%s\n' "$fence" "$diff_output" "$fence" \
+        | pandoc --from=gfm --to=html5 2>/dev/null)
+    cat >"$DIFF_SUFFIX_FILE" <<EOF
+<div id="mdview-diff-modal-content" style="display:none;">$diff_html</div>
+EOF
+    echo true
+}
+
+# Warn about an unusable --diff exactly once, not on every watch cycle.
+if $WANT_DIFF && ! git -C "$MD_DIR_ABS" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "Warning: --diff ignored, $MD_FILE is not inside a git repository." >&2
+    WANT_DIFF=false
+fi
+
+# Render the given files (defaults to all of MD_FILES) in parallel with a
+# fixed-size worker pool (override with MDVIEW_JOBS).
+render_all() {
+    local -a targets=("$@")
+    (( ${#targets[@]} )) || targets=("${MD_FILES[@]}")
+
+    local has_diff
+    has_diff=$(build_diff_suffix)
+
+    local jobs=${MDVIEW_JOBS:-4}
+    (( jobs < 1 )) && jobs=1
+    local running=0 src rel dst
+    for src in "${targets[@]}"; do
+        rel=$(relpath "$src" "$BASE_DIR")
+        dst="$OUT_DIR/${rel%.*}.html"
+        # Only attach the diff to the entry file.
+        if [[ "$has_diff" == "true" && "$src" == "$MD_FILE_ABS" ]]; then
+            render_md "$src" "$dst" true &
+        else
+            render_md "$src" "$dst" &
+        fi
+        if (( ++running >= jobs )); then
+            wait -n
+            (( running-- ))
+        fi
+    done
+    wait
+}
+
+if $ALL; then
+    echo "Rendering ${#MD_FILES[@]} markdown file(s) under $BASE_DIR ..." >&2
+fi
+render_all
+
+ENTRY_REL=$(relpath "$MD_FILE_ABS" "$BASE_DIR")
+ENTRY_HTML="$OUT_DIR/${ENTRY_REL%.*}.html"
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+    echo "Wrote ${#MD_FILES[@]} file(s) to $OUT_DIR" >&2
+    echo "Entry: $ENTRY_HTML" >&2
+else
+    open -a "Google Chrome" "$ENTRY_HTML"
+    if ! $WATCH; then
+        # Keep the temp dir alive so Chrome can keep reading & navigating
+        # between pages after we exit.
+        trap - EXIT
+    fi
+fi
+
+$WATCH || exit 0
+
+# --- watch mode -------------------------------------------------------------
+# Poll mtimes rather than depending on fswatch/entr. Re-globbing each cycle
+# also picks up files created or deleted under BASE_DIR after startup.
+
+# Exit quietly on Ctrl-C; the EXIT trap still fires and clears TMP_DIR.
+trap 'echo >&2; exit 0' INT TERM
+
+INTERVAL=${MDVIEW_WATCH_INTERVAL:-1}
+
+# Print "<path>\t<mtime>" for every currently watched file.
+snapshot() {
+    local f
+    for f in "${MD_FILES[@]}"; do
+        printf '%s\t%s\n' "$f" "$(stat -f %m "$f" 2>/dev/null || echo missing)"
+    done
+}
+
+# Fingerprint of the entry file's git diff. `git commit` changes the diff
+# without touching any mtime, so the diff needs watching in its own right or
+# the embedded Diff modal goes stale.
+diff_fingerprint() {
+    $WANT_DIFF || return 0
+    git -C "$MD_DIR_ABS" diff HEAD -- "$(basename "$MD_FILE_ABS")" 2>/dev/null | md5
+}
+
+PREV_SNAPSHOT=$(snapshot)
+PREV_DIFF_FP=$(diff_fingerprint)
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    echo "Watching for changes (reload the page in Chrome to see updates). Ctrl-C to stop." >&2
+else
+    echo "Watching for changes. Ctrl-C to stop." >&2
+fi
+
+while true; do
+    sleep "$INTERVAL"
+
+    collect_md_files
+    CUR_SNAPSHOT=$(snapshot)
+    CUR_DIFF_FP=$(diff_fingerprint)
+
+    # Re-render only the files whose mtime line changed or that are new.
+    CHANGED=()
+    if [[ "$CUR_SNAPSHOT" != "$PREV_SNAPSHOT" ]]; then
+        while IFS=$'\t' read -r path _; do
+            [[ -n "$path" && -f "$path" ]] && CHANGED+=("$path")
+        done < <(comm -13 <(printf '%s\n' "$PREV_SNAPSHOT" | sort) \
+                         <(printf '%s\n' "$CUR_SNAPSHOT" | sort))
+    fi
+
+    # A changed diff only affects the entry page, which is where it's embedded.
+    if [[ "$CUR_DIFF_FP" != "$PREV_DIFF_FP" && " ${CHANGED[*]} " != *" $MD_FILE_ABS "* ]]; then
+        CHANGED+=("$MD_FILE_ABS")
+    fi
+
+    PREV_SNAPSHOT=$CUR_SNAPSHOT
+    PREV_DIFF_FP=$CUR_DIFF_FP
+    (( ${#CHANGED[@]} )) || continue
+
+    render_all "${CHANGED[@]}"
+    printf '[%s] re-rendered %d file(s): %s\n' \
+        "$(date +%H:%M:%S)" "${#CHANGED[@]}" \
+        "$(printf '%s ' "${CHANGED[@]##*/}")" >&2
+done
