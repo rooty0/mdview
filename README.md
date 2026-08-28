@@ -35,7 +35,7 @@ brew install shellcheck pre-commit
 cd ~/me/scripts/shell/mdview && pre-commit install
 ```
 
-macOS only — it relies on `open -a`, `~/Library/Caches`, and BSD `stat`.
+macOS only - it relies on `open -a`, `~/Library/Caches`, and BSD `stat`.
 
 ## Flags
 
@@ -72,7 +72,7 @@ render as diagrams, each with its own download-as-SVG button.
 
 ## Notes
 
-`--watch` does **not** reload the browser — hit reload yourself. Chrome
+`--watch` does **not** reload the browser - hit reload yourself. Chrome
 blocks `fetch()` on `file://` pages, so live reload would mean either a
 local HTTP server or AppleScript driving the browser; neither felt worth it.
 
@@ -89,4 +89,4 @@ shellcheck mdview
 ```
 
 `AGENTS.md` documents the architecture and, more usefully, the non-obvious
-constraints — read it before changing the script.
+constraints - read it before changing the script.
