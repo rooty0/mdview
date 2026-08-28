@@ -2,6 +2,8 @@
 
 Render Markdown to GitHub-styled HTML and open it in Chrome.
 
+![mdview rendering example.md in Chrome](example.png)
+
 One Bash script, no server, no build step. Pages are plain `file://` HTML,
 so they work offline and you can keep them around after the tool exits.
 
