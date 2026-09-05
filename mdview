@@ -1019,6 +1019,14 @@ relpath() {
     echo "${rel:-.}"
 }
 
+# gfm turns on tex_math_dollars, which reads two "$" amounts in one
+# paragraph as inline-math delimiters and swallows everything between them
+# — bold, code spans and all — into a math span. Prose about money is far
+# more common here than TeX, and nothing renders math anyway (no MathJax or
+# KaTeX is loaded), so both math extensions are off: ```math fences come out
+# as ordinary code blocks, which at least stay readable and copyable.
+PANDOC_FROM="gfm-tex_math_dollars-tex_math_gfm"
+
 render_md() {
     local src=$1 dst=$2 with_diff=${3:-false}
     local dst_dir
@@ -1059,10 +1067,10 @@ render_md() {
     # --raw: enable sourcepos so every element carries data-pos, and embed the
     # raw markdown so JS can slice it on demand. Per-file after-file so each
     # page gets its own source.
-    local from_fmt="gfm"
+    local from_fmt="$PANDOC_FROM"
     local raw_after=""
     if $SHOW_RAW; then
-        from_fmt="gfm+sourcepos"
+        from_fmt="$PANDOC_FROM+sourcepos"
         raw_after=$(mktemp "$TMP_DIR/raw-suffix.XXXXXXXX")
         {
             printf '<script type="text/markdown" id="mdview-source">'
@@ -1136,7 +1144,7 @@ build_diff_suffix() {
     fence=$(printf "%${fence_len}s" "" | tr ' ' '`')
     # Render the diff through pandoc so Skylighting colours the +/- lines.
     diff_html=$(printf '%sdiff\n%s\n%s\n' "$fence" "$diff_output" "$fence" \
-        | pandoc --from=gfm --to=html5 2>/dev/null)
+        | pandoc --from="$PANDOC_FROM" --to=html5 2>/dev/null)
     cat >"$DIFF_SUFFIX_FILE" <<EOF
 <div id="mdview-diff-modal-content" style="display:none;">$diff_html</div>
 EOF

@@ -223,6 +223,37 @@ test_mermaid() {
     assert_contains "svg download button wired up" "$out/nested/page.html" 'mdview-svg-dl'
 }
 
+# gfm's tex_math_dollars reads two "$" amounts in one paragraph as inline
+# math and swallows the markup between them, so prose about money loses its
+# bold and code spans and pandoc warns on every render.
+test_no_tex_math() {
+    local src="$TMP/math" out="$TMP/math-out"
+    mkdir -p "$src"
+    cat >"$src/money.md" <<'MD'
+Cutting the pins saves ~$8.3k/yr. The other **104 HPAs** are on
+`prod-group-*` and that is where the remaining ~$23k/yr sits.
+
+```math
+\sqrt{x}
+```
+MD
+    local warnings
+    # mdview's own progress lines also go to stderr, so look only for pandoc's.
+    warnings=$("$MDVIEW" -o "$out" "$src/money.md" 2>&1 >/dev/null | grep 'WARNING' || true)
+    local f="$out/money.html"
+
+    assert_eq "pandoc emits no warnings" "$warnings" ""
+    # A <pre class="math"> code block is the desired outcome; a <span> is not.
+    assert_absent "currency does not become a math span" "$f" '<span class="math'
+    assert_contains "bold survives between two dollar amounts" "$f" '<strong>104 HPAs</strong>'
+    assert_contains "code span survives between two dollar amounts" "$f" '<code>prod-group-\*</code>'
+    # shellcheck disable=SC2016  # \$ is a regex escape, not a shell variable
+    assert_contains "both dollar amounts kept verbatim" "$f" '\$8\.3k/yr'
+    # shellcheck disable=SC2016  # \$ is a regex escape, not a shell variable
+    assert_contains "second dollar amount kept verbatim" "$f" '\$23k/yr'
+    assert_contains "math fence degrades to a code block" "$f" '<pre class="math"><code>'
+}
+
 test_raw_off() {
     local src="$TMP/rawoff" out="$TMP/rawoff-out"
     make_fixture "$src"
@@ -439,6 +470,7 @@ ALL_TESTS=(
     asset_rewriting
     all_mode
     mermaid
+    no_tex_math
     raw_off
     raw_on
     parallel_isolation

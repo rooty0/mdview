@@ -152,6 +152,21 @@ so a document with no code blocks got an uncoloured diff modal. The
 `#mdview-diff-body .va / .st / .dt / .kw` rules in `$HEADER_FILE` exist to
 cover that and must stay.
 
+### Both TeX math extensions are off on purpose
+
+`$PANDOC_FROM` is `gfm-tex_math_dollars-tex_math_gfm`. Plain `gfm` enables
+both, and `tex_math_dollars` reads two `$` amounts in one paragraph as
+inline-math delimiters — everything between them, bold and code spans
+included, gets swallowed into a `<span class="math inline">` and rendered as
+raw text, plus a `[WARNING] Could not convert TeX math` on every render.
+Notes here discuss money constantly, so this fired a lot.
+
+Nothing renders math anyway: no MathJax or KaTeX is loaded, so math spans
+have always displayed as literal TeX. With both extensions off, ` ```math `
+fences come out as `<pre class="math">` code blocks, which stay readable and
+copyable. Re-enabling either one means also caching and injecting a math
+renderer the way mermaid is handled.
+
 ### Mermaid lives in a monorepo
 
 `releases/latest` for `mermaid-js/mermaid` returns sub-package tags. The
