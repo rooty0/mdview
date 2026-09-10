@@ -12,6 +12,7 @@ mdview README.md              # render and open in Chrome
 mdview -a README.md           # also render every .md under the tree,
                               # with working links between the pages
 mdview -W notes.md            # re-render on every save
+mdview -W notes.md &          # ...in the background, so you keep your prompt
 mdview -o ./site -a README.md # write to a directory instead of opening Chrome
 ```
 
@@ -78,13 +79,19 @@ render as diagrams, each with its own download-as-SVG button.
 blocks `fetch()` on `file://` pages, so live reload would mean either a
 local HTTP server or AppleScript driving the browser; neither felt worth it.
 
+Backgrounding a watcher with `&` is fine, and sessions can run for days. Two
+things to know: it takes the `SIGHUP` when you close the terminal (`nohup
+mdview -W notes.md &` if you don't want that), and the temp dir is cleaned up
+on exit, so the Chrome tab goes dead once you stop the watcher. Add `-o DIR`
+for pages that outlive the session.
+
 `--raw` roughly doubles HTML size, because pandoc has to annotate every
 element with its source position. That's why it's opt-in.
 
 ## Development
 
 ```bash
-./test.sh            # 50 assertions, ~30s
+./test.sh            # 69 assertions, ~55s
 ./test.sh -l         # list test names
 ./test.sh raw diff   # run a subset
 shellcheck mdview
