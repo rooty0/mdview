@@ -152,6 +152,32 @@ so a document with no code blocks got an uncoloured diff modal. The
 `#mdview-diff-body .va / .st / .dt / .kw` rules in `$HEADER_FILE` exist to
 cover that and must stay.
 
+### macOS reaps the temp dir under long `--watch` sessions
+
+Files under `/var/folders/.../T/` that haven't been touched for ~3 days get
+deleted by the OS while the process is still running. A watch session left
+up over a weekend lost `header.html`, `before.html`, `after.html`,
+`mdlinks.lua` and `mermaid-header.tpl.html`, and every render from then on
+died with `pandoc: Uncaught exception ... before.html: does not exist`. Only
+`diff-suffix.html` survived, because it gets rewritten each pass.
+
+So nothing may be written once at startup and assumed to persist.
+`ensure_workspace()` runs before every render pass and recreates whatever
+is missing — shared assets, `OUT_DIR`, the asset symlinks, and the cached
+CSS/JS if the cache itself was purged. `write_shared_assets()` exists purely
+so it can be re-invoked.
+
+### Background render failures have to be reported explicitly
+
+`render_md` runs as a background job, so a non-zero exit reaches nobody:
+`wait` doesn't surface it and `set -e` doesn't fire. For a long time the
+watch loop printed `re-rendered N file(s)` on every cycle while pandoc was
+failing and the HTML was hours stale.
+
+Failing renders now append to `$FAIL_LOG`, which `render_all` truncates per
+pass and checks afterwards, returning non-zero and listing the files. Keep
+that path intact when touching the worker pool.
+
 ### Both TeX math extensions are off on purpose
 
 `$PANDOC_FROM` is `gfm-tex_math_dollars-tex_math_gfm`. Plain `gfm` enables

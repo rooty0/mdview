@@ -83,44 +83,52 @@ mkdir -p "$CACHE_DIR"
 
 CSS_FILE="$CACHE_DIR/github-markdown.css"
 CSS_REPO="sindresorhus/github-markdown-css"
-
-if [[ ! -f "$CSS_FILE" ]]; then
-    echo "Fetching latest github-markdown-css release..." >&2
-    LATEST_TAG=$(
-        curl -fsSL "https://api.github.com/repos/${CSS_REPO}/releases/latest" \
-            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
-            | head -n1
-    )
-    if [[ -z "${LATEST_TAG:-}" ]]; then
-        echo "Error: could not determine latest release tag for ${CSS_REPO}" >&2
-        exit 1
-    fi
-    URL="https://raw.githubusercontent.com/${CSS_REPO}/${LATEST_TAG}/github-markdown.css"
-    echo "Downloading ${URL}" >&2
-    curl -fsSL "$URL" -o "$CSS_FILE"
-fi
-
 MERMAID_FILE="$CACHE_DIR/mermaid.min.js"
 MERMAID_REPO="mermaid-js/mermaid"
 
-if [[ ! -f "$MERMAID_FILE" ]]; then
-    echo "Fetching latest mermaid release..." >&2
-    # The mermaid-js/mermaid repo is a monorepo; filter for tags starting with "mermaid@".
-    MERMAID_TAG=$(
-        curl -fsSL "https://api.github.com/repos/${MERMAID_REPO}/releases?per_page=50" \
-            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
-            | grep '^mermaid@' \
-            | head -n1
-    )
-    if [[ -z "${MERMAID_TAG:-}" ]]; then
-        echo "Error: could not determine latest release tag for ${MERMAID_REPO}" >&2
-        exit 1
+# Download the cached assets if they aren't there. Idempotent: re-run at the
+# start of every render pass so a --watch session recovers if the cache is
+# purged underneath it.
+fetch_cached_assets() {
+    if [[ ! -f "$CSS_FILE" ]]; then
+        echo "Fetching latest github-markdown-css release..." >&2
+        local latest_tag url
+        latest_tag=$(
+            curl -fsSL "https://api.github.com/repos/${CSS_REPO}/releases/latest" \
+                | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
+                | head -n1
+        )
+        if [[ -z "${latest_tag:-}" ]]; then
+            echo "Error: could not determine latest release tag for ${CSS_REPO}" >&2
+            return 1
+        fi
+        url="https://raw.githubusercontent.com/${CSS_REPO}/${latest_tag}/github-markdown.css"
+        echo "Downloading ${url}" >&2
+        curl -fsSL "$url" -o "$CSS_FILE" || return 1
     fi
-    MERMAID_VER=${MERMAID_TAG#mermaid@}
-    URL="https://cdn.jsdelivr.net/npm/mermaid@${MERMAID_VER}/dist/mermaid.min.js"
-    echo "Downloading mermaid@${MERMAID_VER} from jsDelivr..." >&2
-    curl -fsSL "$URL" -o "$MERMAID_FILE"
-fi
+
+    if [[ ! -f "$MERMAID_FILE" ]]; then
+        echo "Fetching latest mermaid release..." >&2
+        # The mermaid-js/mermaid repo is a monorepo; filter for tags starting with "mermaid@".
+        local mermaid_tag mermaid_ver url
+        mermaid_tag=$(
+            curl -fsSL "https://api.github.com/repos/${MERMAID_REPO}/releases?per_page=50" \
+                | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' \
+                | grep '^mermaid@' \
+                | head -n1
+        )
+        if [[ -z "${mermaid_tag:-}" ]]; then
+            echo "Error: could not determine latest release tag for ${MERMAID_REPO}" >&2
+            return 1
+        fi
+        mermaid_ver=${mermaid_tag#mermaid@}
+        url="https://cdn.jsdelivr.net/npm/mermaid@${mermaid_ver}/dist/mermaid.min.js"
+        echo "Downloading mermaid@${mermaid_ver} from jsDelivr..." >&2
+        curl -fsSL "$url" -o "$MERMAID_FILE" || return 1
+    fi
+}
+
+fetch_cached_assets || exit 1
 
 # Honors $TMPDIR (i.e. /var/folders/... on macOS, auto-cleaned by the OS).
 TMP_DIR=$(mktemp -d -t mdview)
@@ -136,18 +144,15 @@ else
     OUT_DIR="$TMP_DIR/site"
     mkdir -p "$OUT_DIR"
 fi
-# Symlink cached assets into the site dir so pages can reference them with
-# clean relative paths (e.g. "../github-markdown.css") instead of leaking
-# absolute filesystem paths into the HTML source. -sfn lets us re-export
-# into the same OUTPUT_DIR repeatedly without stale-symlink errors.
-ln -sfn "$CSS_FILE"     "$OUT_DIR/github-markdown.css"
-ln -sfn "$MERMAID_FILE" "$OUT_DIR/mermaid.min.js"
-
 HEADER_FILE="$TMP_DIR/header.html"
 BEFORE_FILE="$TMP_DIR/before.html"
 AFTER_FILE="$TMP_DIR/after.html"
 LUA_FILTER="$TMP_DIR/mdlinks.lua"
 MERMAID_HEADER_TEMPLATE="$TMP_DIR/mermaid-header.tpl.html"
+
+# Write the templates and filters every render pass depends on. Split into a
+# function so it can be re-run: see ensure_workspace below.
+write_shared_assets() {
 
 cat >"$MERMAID_HEADER_TEMPLATE" <<'EOF'
 <script src="__MERMAID_SRC__"></script>
@@ -955,6 +960,35 @@ function Image(el)
 end
 LUA
 
+}
+
+# Make sure everything a render pass reads actually exists, then (re)point the
+# asset symlinks. Called before every pass, not just at startup, because macOS
+# reaps files under /var/folders that haven't been touched for ~3 days: a
+# --watch session left running over a weekend loses header.html, before.html
+# and friends while still running, and every render after that fails. Only
+# diff-suffix.html used to survive, because it gets rewritten each pass.
+ensure_workspace() {
+    fetch_cached_assets || return 1
+    mkdir -p "$OUT_DIR"
+
+    local f
+    for f in "$HEADER_FILE" "$BEFORE_FILE" "$AFTER_FILE" "$LUA_FILTER" \
+             "$MERMAID_HEADER_TEMPLATE"; do
+        if [[ ! -f "$f" ]]; then
+            write_shared_assets
+            break
+        fi
+    done
+
+    # Symlink cached assets into the site dir so pages can reference them with
+    # clean relative paths (e.g. "../github-markdown.css") instead of leaking
+    # absolute filesystem paths into the HTML source. -sfn lets us re-point
+    # into the same OUTPUT_DIR repeatedly without stale-symlink errors.
+    ln -sfn "$CSS_FILE"     "$OUT_DIR/github-markdown.css"
+    ln -sfn "$MERMAID_FILE" "$OUT_DIR/mermaid.min.js"
+}
+
 # Resolve the entry file to an absolute path and pick the base directory.
 MD_DIR_ABS=$(cd "$(dirname "$MD_FILE")" && pwd)
 MD_FILE_ABS="$MD_DIR_ABS/$(basename "$MD_FILE")"
@@ -1085,6 +1119,8 @@ render_md() {
         after_files+=(-A "$raw_after")
     fi
 
+    # Record rather than propagate: these run as background jobs, so the only
+    # way a failure reaches the caller is through this log.
     pandoc \
         --from="$from_fmt" \
         --to=html5 \
@@ -1096,7 +1132,8 @@ render_md() {
         -B "$BEFORE_FILE" \
         "${after_files[@]}" \
         -o "$dst" \
-        "$src"
+        "$src" \
+        || printf '%s\n' "$src" >>"$FAIL_LOG"
 
     # These are per-invocation scratch files; drop them so a long --watch
     # session doesn't accumulate one pair per file per cycle in TMP_DIR.
@@ -1106,6 +1143,7 @@ render_md() {
 }
 
 DIFF_SUFFIX_FILE="$TMP_DIR/diff-suffix.html"
+FAIL_LOG="$TMP_DIR/failures"
 
 # Rebuild the diff suffix file from the working tree's current state and echo
 # "true" if a diff was produced. Recomputed on every pass so --watch reflects
@@ -1158,10 +1196,14 @@ if $WANT_DIFF && ! git -C "$MD_DIR_ABS" rev-parse --git-dir >/dev/null 2>&1; the
 fi
 
 # Render the given files (defaults to all of MD_FILES) in parallel with a
-# fixed-size worker pool (override with MDVIEW_JOBS).
+# fixed-size worker pool (override with MDVIEW_JOBS). Returns non-zero if any
+# file failed, having listed the failures on stderr.
 render_all() {
     local -a targets=("$@")
     (( ${#targets[@]} )) || targets=("${MD_FILES[@]}")
+
+    ensure_workspace || return 1
+    : >"$FAIL_LOG"
 
     local has_diff
     has_diff=$(build_diff_suffix)
@@ -1184,12 +1226,22 @@ render_all() {
         fi
     done
     wait
+
+    local failed=0
+    [[ -s "$FAIL_LOG" ]] && failed=$(wc -l <"$FAIL_LOG" | tr -d ' ')
+    if (( failed )); then
+        echo "Error: pandoc failed on $failed file(s):" >&2
+        sed 's|^|  |' "$FAIL_LOG" >&2
+        return 1
+    fi
+    return 0
 }
 
 if $ALL; then
     echo "Rendering ${#MD_FILES[@]} markdown file(s) under $BASE_DIR ..." >&2
 fi
-render_all
+RENDER_OK=true
+render_all || RENDER_OK=false
 
 ENTRY_REL=$(relpath "$MD_FILE_ABS" "$BASE_DIR")
 ENTRY_HTML="$OUT_DIR/${ENTRY_REL%.*}.html"
@@ -1197,7 +1249,7 @@ ENTRY_HTML="$OUT_DIR/${ENTRY_REL%.*}.html"
 if [[ -n "$OUTPUT_DIR" ]]; then
     echo "Wrote ${#MD_FILES[@]} file(s) to $OUT_DIR" >&2
     echo "Entry: $ENTRY_HTML" >&2
-else
+elif [[ -f "$ENTRY_HTML" ]]; then
     open -a "Google Chrome" "$ENTRY_HTML"
     if ! $WATCH; then
         # Keep the temp dir alive so Chrome can keep reading & navigating
@@ -1206,7 +1258,9 @@ else
     fi
 fi
 
-$WATCH || exit 0
+# A failed one-shot run must not look successful to a caller; in watch mode
+# stay up regardless, since the next edit may well succeed.
+$WATCH || { $RENDER_OK && exit 0 || exit 1; }
 
 # --- watch mode -------------------------------------------------------------
 # Poll mtimes rather than depending on fswatch/entr. Re-globbing each cycle
@@ -1267,8 +1321,13 @@ while true; do
     PREV_DIFF_FP=$CUR_DIFF_FP
     (( ${#CHANGED[@]} )) || continue
 
-    render_all "${CHANGED[@]}"
-    printf '[%s] re-rendered %d file(s): %s\n' \
-        "$(date +%H:%M:%S)" "${#CHANGED[@]}" \
-        "$(printf '%s ' "${CHANGED[@]##*/}")" >&2
+    if render_all "${CHANGED[@]}"; then
+        printf '[%s] re-rendered %d file(s): %s\n' \
+            "$(date +%H:%M:%S)" "${#CHANGED[@]}" \
+            "$(printf '%s ' "${CHANGED[@]##*/}")" >&2
+    else
+        printf '[%s] re-render FAILED for %d file(s): %s\n' \
+            "$(date +%H:%M:%S)" "${#CHANGED[@]}" \
+            "$(printf '%s ' "${CHANGED[@]##*/}")" >&2
+    fi
 done

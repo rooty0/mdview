@@ -439,6 +439,71 @@ test_watch() {
     fi
 }
 
+# macOS reaps files under /var/folders that haven't been touched for ~3
+# days, so a --watch session left running over a weekend loses header.html,
+# before.html and friends while still running. Every render after that
+# failed, and the loop still logged "re-rendered".
+test_survives_reaped_assets() {
+    local src="$TMP/reap" out="$TMP/reap-out"
+    make_fixture "$src"
+
+    local before
+    before=$(list_run_dirs)
+    ( cd "$src" && exec env MDVIEW_WATCH_INTERVAL=1 \
+        "$MDVIEW" -a -W -o "$out" index.md >/dev/null 2>"$TMP/reap.err" ) &
+    local md_pid=$!
+    sleep 3
+
+    local live
+    live=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$(list_run_dirs)") | head -1)
+    if [[ -z "$live" || ! -d "$live" ]]; then
+        bad "could not locate the watch session's temp dir"
+        stop_bg "$md_pid"
+        return
+    fi
+
+    # Simulate the reaper: delete the write-once assets out from under it.
+    rm -f "$live/header.html" "$live/before.html" "$live/after.html" \
+          "$live/mdlinks.lua" "$live/mermaid-header.tpl.html"
+    assert_eq "assets really were removed" \
+        "$([[ -f "$live/before.html" ]] && echo present || echo gone)" "gone"
+
+    printf '\n## After the reaper\n' >>"$src/index.md"
+    sleep 3
+
+    assert_contains "render recovers after assets are reaped" \
+        "$out/index.html" 'After the reaper'
+    assert_eq "shared assets were rewritten" \
+        "$([[ -f "$live/before.html" && -f "$live/header.html" ]] && echo yes)" "yes"
+    assert_absent "no pandoc crash reported" "$TMP/reap.err" 'Uncaught exception'
+    assert_absent "no failure logged" "$TMP/reap.err" 'FAILED'
+
+    stop_bg "$md_pid"
+}
+
+# A render that fails must not be reported as a success.
+test_reports_render_failure() {
+    local src="$TMP/fail" out="$TMP/fail-out"
+    make_fixture "$src"
+
+    # A directory where the output file must go makes pandoc's write fail.
+    mkdir -p "$out"
+    mkdir -p "$out/index.html"
+
+    local err rc
+    err=$("$MDVIEW" -o "$out" "$src/index.md" 2>&1 >/dev/null)
+    rc=$?
+    assert_eq "failed render exits non-zero" "$rc" "1"
+    case "$err" in
+        *"pandoc failed on"*) ok "failure is reported on stderr" ;;
+        *) bad "failure is reported on stderr — got: ${err:0:120}" ;;
+    esac
+    case "$err" in
+        *"index.md"*) ok "the failing file is named" ;;
+        *) bad "the failing file is named" ;;
+    esac
+}
+
 test_cli() {
     local out
     out=$("$MDVIEW" -h 2>&1)
@@ -478,6 +543,8 @@ ALL_TESTS=(
     diff
     diff_outside_git
     watch
+    survives_reaped_assets
+    reports_render_failure
 )
 
 if [[ "${1:-}" == "-l" || "${1:-}" == "--list" ]]; then
