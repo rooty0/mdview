@@ -1271,11 +1271,21 @@ trap 'echo >&2; exit 0' INT TERM
 
 INTERVAL=${MDVIEW_WATCH_INTERVAL:-1}
 
-# Print "<path>\t<mtime>" for every currently watched file.
+# Print "<path>\t<mtime>\t<output state>" for every currently watched file.
+#
+# The output state is part of the snapshot because the reaper takes rendered
+# pages too, not just the scratch assets (see AGENTS.md). A page that vanished
+# has to be rebuilt even though its source is untouched, and folding it in here
+# means the existing change detection handles it for free. A page that stays
+# missing because pandoc keeps failing looks unchanged on the next cycle, so
+# this can't spin.
 snapshot() {
-    local f
+    local f rel mtime out
     for f in "${MD_FILES[@]}"; do
-        printf '%s\t%s\n' "$f" "$(stat -f %m "$f" 2>/dev/null || echo missing)"
+        mtime=$(stat -f %m "$f" 2>/dev/null || echo missing)
+        rel=$(relpath "$f" "$BASE_DIR")
+        if [[ -f "$OUT_DIR/${rel%.*}.html" ]]; then out=built; else out=gone; fi
+        printf '%s\t%s\t%s\n' "$f" "$mtime" "$out"
     done
 }
 
@@ -1322,6 +1332,12 @@ while true; do
     (( ${#CHANGED[@]} )) || continue
 
     if render_all "${CHANGED[@]}"; then
+        # The snapshot above was taken before rendering, so any page it recorded
+        # as gone is now built; without this the next cycle reads our own output
+        # as a change and renders a second time. Only the output field is
+        # corrected -- mtimes stay as sampled, so an edit that lands mid-render
+        # still looks new next cycle instead of being skipped.
+        PREV_SNAPSHOT=${PREV_SNAPSHOT//$'\t'gone/$'\t'built}
         printf '[%s] re-rendered %d file(s): %s\n' \
             "$(date +%H:%M:%S)" "${#CHANGED[@]}" \
             "$(printf '%s ' "${CHANGED[@]##*/}")" >&2

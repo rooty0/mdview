@@ -481,6 +481,39 @@ test_survives_reaped_assets() {
     stop_bg "$md_pid"
 }
 
+# The reaper takes rendered pages too, not just the scratch assets. A page
+# that vanished has to come back without waiting for the source to be edited,
+# which for a session left running for days may never happen.
+test_rebuilds_vanished_output() {
+    local src="$TMP/vanish" out="$TMP/vanish-out"
+    make_fixture "$src"
+
+    ( cd "$src" && exec env MDVIEW_WATCH_INTERVAL=1 \
+        "$MDVIEW" -W -o "$out" index.md >/dev/null 2>"$TMP/vanish.err" ) &
+    local md_pid=$!
+    sleep 3
+    assert_eq "initial render landed" \
+        "$([[ -f "$out/index.html" ]] && echo yes)" "yes"
+
+    rm -f "$out/index.html"
+    sleep 4
+    assert_eq "vanished page is rebuilt without an edit" \
+        "$([[ -f "$out/index.html" ]] && echo yes)" "yes"
+
+    # Recording the snapshot before rendering used to make the next cycle read
+    # our own output as a change, costing a second pass every time.
+    sleep 2
+    assert_eq "rebuilt exactly once, no flip-flop" \
+        "$(grep -c 're-rendered' "$TMP/vanish.err" | tr -d ' ')" "1"
+
+    # The output field is corrected in place, so mtime tracking must still work.
+    printf '\n## Later edit\n' >>"$src/index.md"
+    sleep 3
+    assert_contains "ordinary edits still tracked" "$out/index.html" 'Later edit'
+
+    stop_bg "$md_pid"
+}
+
 # A render that fails must not be reported as a success.
 test_reports_render_failure() {
     local src="$TMP/fail" out="$TMP/fail-out"
@@ -543,6 +576,7 @@ ALL_TESTS=(
     diff
     diff_outside_git
     watch
+    rebuilds_vanished_output
     survives_reaped_assets
     reports_render_failure
 )

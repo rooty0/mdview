@@ -167,6 +167,17 @@ is missing — shared assets, `OUT_DIR`, the asset symlinks, and the cached
 CSS/JS if the cache itself was purged. `write_shared_assets()` exists purely
 so it can be re-invoked.
 
+The reaper takes rendered pages under `OUT_DIR` too, and the watch loop only
+re-renders sources whose mtime moved — so a vanished page would never come
+back on a session where you don't happen to edit that file again. `snapshot()`
+therefore records whether each page exists alongside its mtime, which lets the
+existing change detection rebuild it. Two consequences to preserve: the
+snapshot is sampled *before* rendering, so a successful pass rewrites its own
+`gone` markers to `built` (otherwise the next cycle reads our output as a
+change and renders twice), and only that field is corrected — mtimes stay as
+sampled so an edit landing mid-render still looks new next cycle rather than
+being silently skipped.
+
 ### Background render failures have to be reported explicitly
 
 `render_md` runs as a background job, so a non-zero exit reaches nobody:
